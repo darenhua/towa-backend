@@ -5,6 +5,7 @@ from fastapi import APIRouter, HTTPException, status
 from src.db.models import VideoAnalysisRequest, VideoAnalysisResponse
 from anthropic import AsyncAnthropic
 from supabase import create_client, Client
+from dotenv import load_dotenv
 import os
 import time
 
@@ -16,7 +17,9 @@ import requests
 from twelvelabs import TwelveLabs
 from twelvelabs.types import VideoSegment
 from twelvelabs.embed import TasksStatusResponse
+from twelvelabs.indexes import IndexesCreateRequestModelsItem
 
+load_dotenv()
 
 router = APIRouter(prefix="/video", tags=["video"])
 
@@ -34,7 +37,7 @@ anthropic_client = (
 
 # Initialize TwelveLabs
 TWELVELABS_API_KEY = os.getenv("TWELVELABS_API_KEY", "")
-
+twelvelabs_client = TwelveLabs(api_key=TWELVELABS_API_KEY)
 
 # Video Processing Constants
 VALID_ASPECT_RATIOS = {
@@ -51,6 +54,114 @@ MAX_RESOLUTION = (3840, 2160)
 MIN_DURATION = 4  # seconds
 MAX_DURATION = 7200  # seconds (2 hours)
 MAX_FILE_SIZE = 2 * 1024 * 1024 * 1024  # 2GB in bytes
+
+
+@router.post("/{job_id}/initialize")
+async def initialize(job_id: str):
+    towa_index_id = get_or_create_index()
+
+    job_result = supabase.table("jobs").select("ads_id").eq("id", job_id).execute()
+
+    ads_id = job_result.data[0]["ads_id"]
+    print(f"✓ Found ads_id: {ads_id}")
+
+    # Fetch video from Supabase storage
+    bucket_name = "videos"
+    file_path = f"jobs/{job_id}/ad.mp4"
+
+    print(f"Fetching video from bucket '{bucket_name}' at path '{file_path}'...")
+
+    # Download video from Supabase storage
+    video_response = supabase.storage.from_(bucket_name).download(file_path)
+    print(f"✓ Video downloaded: {len(video_response)} bytes")
+
+    # Save to temporary file
+    with tempfile.NamedTemporaryFile(delete=False, suffix=".mp4") as temp_file:
+        temp_file.write(video_response)
+        temp_file_path = temp_file.name
+
+    print(f"✓ Video saved to temporary file: {temp_file_path}")
+
+    new_path = await process_and_validate_video(Path(temp_file_path))
+    # Upload video using SDK
+    with open(new_path, "rb") as video_file:
+        task = twelvelabs_client.tasks.create(
+            index_id=towa_index_id,
+            video_file=video_file,
+            enable_video_stream=True,  # Enable streaming
+        )
+
+    print(f"Video upload initiated - Task ID: {task.id}")
+
+    def on_task_update(current_task):
+        print(f"  Status: {current_task.status}")
+
+    completed_task = twelvelabs_client.tasks.wait_for_done(
+        task_id=task.id, sleep_interval=5, callback=on_task_update
+    )
+
+    video_id = completed_task.video_id
+
+    summary = twelvelabs_client.summarize(video_id=video_id, type="summary")
+
+    print("TESTSUMMARY", summary)
+
+    description_result = (
+        supabase.table("ads")
+        .update({"description": summary.summary})
+        .eq("id", ads_id)
+        .execute()
+    )
+
+    # Clean up temporary files
+    try:
+        if os.path.exists(temp_file_path):
+            os.remove(temp_file_path)
+            print(f"✓ Deleted temporary file: {temp_file_path}")
+    except Exception as e:
+        print(f"Warning: Failed to delete {temp_file_path}: {e}")
+
+    try:
+        if os.path.exists(new_path):
+            os.remove(new_path)
+            print(f"✓ Deleted temporary file: {new_path}")
+    except Exception as e:
+        print(f"Warning: Failed to delete {new_path}: {e}")
+
+    return {
+        "success": True,
+        "job_id": job_id,
+        "ads_id": ads_id,
+        "video_id": video_id,
+        "description": description_result,
+    }
+
+
+def get_or_create_index() -> str:
+    index_name = "towa_index_pegasus"
+
+    indexes = twelvelabs_client.indexes.list()
+    for idx in indexes:
+        if idx.index_name == index_name:
+            print(f"Found existing index: {index_name} (ID: {idx.id})")
+            return idx.id
+
+    # Create new index if none found
+    print(f"Creating new index: {index_name}")
+
+    index = twelvelabs_client.indexes.create(
+        index_name=index_name,
+        models=[
+            IndexesCreateRequestModelsItem(
+                model_name="pegasus1.2",
+                model_options=["visual", "audio"],
+            )
+        ],
+        addons=["thumbnail"],
+    )
+
+    print(f"✓ Index created successfully: {index_name} (ID: {index.id})")
+    return index.id
 
 
 async def fetch_video_blob_from_storage(job_id: str) -> bytes:
@@ -108,7 +219,7 @@ def get_video_metadata(video_path: Path) -> Dict[str, Any]:
     try:
         # Check if FFprobe is available
         result = subprocess.run(
-            ["ffprobe", "-version"], capture_output=True, text=True, timeout=5
+            ["ffprobe", "-version"], capture_output=True, text=True, timeout=30
         )
         if result.returncode != 0:
             raise Exception("FFprobe not found in system PATH. Please install FFmpeg.")
@@ -452,60 +563,7 @@ def find_closest_aspect_ratio(width: int, height: int) -> tuple[str, tuple[int, 
     return ratio_str, (target_width, target_height)
 
 
-async def process_and_validate_video(job_id: str) -> Path:
-    """
-    Complete video processing pipeline: fetch, validate, transform, and return temp file.
-
-    This function orchestrates the entire video processing workflow:
-    1. Fetch video blob from remote storage
-    2. Save to temporary file
-    3. Extract and validate metadata
-    4. Transform video if needed to meet requirements
-    5. Re-validate transformed video
-    6. Return path to processed temp file
-
-    Args:
-        job_id: Job identifier to fetch video
-
-    Returns:
-        Path to processed video temp file (caller must delete after use)
-
-    Raises:
-        HTTPException: If video has unfixable issues or processing fails
-
-    Example:
-        >>> video_path = await process_and_validate_video("job_123")
-        >>> try:
-        >>>     # Upload video to TwelveLabs
-        >>>     video_id = await upload_and_index_video(video_path, "video.mp4")
-        >>> finally:
-        >>>     # Clean up temp file
-        >>>     video_path.unlink()
-    """
-    print(f"\n=== Starting video processing for job_id: {job_id} ===")
-
-    try:
-        # Step 1: Fetch video blob
-        print("Step 1: Fetching video blob from storage...")
-        video_bytes = await fetch_video_blob_from_storage(job_id)
-        print(f"✓ Video blob fetched: {len(video_bytes)} bytes")
-
-        # Save to temp file
-        temp_input = tempfile.NamedTemporaryFile(delete=False, suffix=".mp4")
-        temp_input.write(video_bytes)
-        temp_input.close()
-        input_path = Path(temp_input.name)
-        print(f"✓ Saved to temp file: {input_path}")
-
-    except NotImplementedError as e:
-        # Mock function not yet implemented - provide helpful error
-        raise HTTPException(status_code=status.HTTP_501_NOT_IMPLEMENTED, detail=str(e))
-    except Exception as e:
-        raise HTTPException(
-            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-            detail=f"Failed to fetch video: {str(e)}",
-        )
-
+async def process_and_validate_video(input_path: Path) -> Path:
     try:
         # Step 2: Extract metadata
         print("\nStep 2: Extracting video metadata...")
@@ -616,203 +674,3 @@ async def process_and_validate_video(job_id: str) -> Path:
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
             detail=f"Video processing failed: {str(e)}",
         )
-
-
-@router.post("/{job_id}/video", response_model=VideoAnalysisResponse)
-async def video_understanding(
-    job_id: str, request: Optional[VideoAnalysisRequest] = None
-):
-    """
-    Complete video analysis endpoint:
-    1. Get video URL from Supabase or request
-    2. Upload/reference video in TwelveLabs
-    3. Analyze video with structured JSON schema
-    4. Store results in Supabase ads.description
-    5. Return analysis summary
-    """
-
-
-async def upload_and_index_video(video_path: Path, video_name: str) -> str:
-    """
-    Upload a video to TwelveLabs and wait for indexing to complete.
-
-    Args:
-        video_path: Path to video file
-        video_name: Name of the video
-
-    Returns:
-        Video ID from TwelveLabs
-
-    Raises:
-        Exception: If upload or indexing fails
-    """
-    try:
-        # Initialize TwelveLabs client
-        client = TwelveLabs(api_key=TWELVELABS_API_KEY)
-
-        # Get or create index
-        index_id = await get_or_create_index()
-
-        # Get the index object
-        index = client.indexes.retrieve(index_id)
-
-        print(f"Uploading video: {video_path.name}")
-
-        # Upload video using SDK
-        with open(video_path, "rb") as video_file:
-            task = client.tasks.create(
-                index_id=index.id,
-                video_file=video_file,
-                enable_video_stream=True,  # Enable streaming
-            )
-
-        print(f"Video upload initiated - Task ID: {task.id}")
-
-        # Wait for upload to complete
-        print(f"Processing video: {video_name}")
-
-        def on_task_update(current_task):
-            print(f"  Status: {current_task.status}")
-
-        completed_task = client.tasks.wait_for_done(
-            task_id=task.id, sleep_interval=5, callback=on_task_update
-        )
-
-        if completed_task.status != "ready":
-            error_msg = f"Video upload failed with status: {completed_task.status}"
-            if hasattr(completed_task, "error_message"):
-                error_msg += f" - {completed_task.error_message}"
-            raise Exception(error_msg)
-
-        video_id = completed_task.video_id
-        if not video_id:
-            raise Exception("No video_id returned from completed task")
-
-        print(f"✓ Video uploaded successfully: {video_name} (ID: {video_id})")
-        return video_id
-
-    except Exception as e:
-        raise Exception(f"Failed to upload video: {str(e)}")
-
-
-async def get_or_create_index() -> str:
-    """
-    Get existing TwelveLabs index or create a new one.
-
-    Returns:
-        Index ID
-
-    Raises:
-        Exception: If index retrieval/creation fails
-    """
-    try:
-        # Initialize TwelveLabs client
-        client = TwelveLabs(api_key=TWELVELABS_API_KEY)
-
-        # Check if we have a specific index ID in environment
-        existing_index_id = os.getenv("TWELVELABS_INDEX_ID")
-        if existing_index_id:
-            try:
-                # Verify the index exists
-                index = client.indexes.retrieve(existing_index_id)
-                print(f"Using existing index: {index.index_name} (ID: {index.id})")
-                return index.id
-            except Exception as e:
-                print(f"Warning: Could not retrieve index {existing_index_id}: {e}")
-                print("Will create a new index instead.")
-
-        # Look for existing index with our default name
-        index_name = "swayable-creative-ads"
-        try:
-            indexes = client.indexes.list()
-            for idx in indexes:
-                if idx.index_name == index_name:
-                    print(f"Found existing index: {index_name} (ID: {idx.id})")
-                    return idx.id
-        except Exception as e:
-            print(f"Warning: Could not list indexes: {e}")
-
-        # Create new index if none found
-        print(f"Creating new index: {index_name}")
-
-        # Import the required model class
-        from twelvelabs.indexes import IndexesCreateRequestModelsItem
-
-        index = client.indexes.create(
-            index_name=index_name,
-            models=[
-                IndexesCreateRequestModelsItem(
-                    model_name="marengo2.7",
-                    model_options=["visual", "audio", "generate"],
-                )
-            ],
-            addons=["thumbnail"],
-        )
-
-        print(f"✓ Index created successfully: {index_name} (ID: {index.id})")
-        return index.id
-
-    except Exception as e:
-        raise Exception(f"Failed to get or create index: {str(e)}")
-
-
-async def analyze_video_with_twelvelabs(
-    video_id: str, video_name: str
-) -> Dict[str, Any]:
-    """
-    Analyze video using TwelveLabs analyze endpoint with structured JSON schema.
-
-    Args:
-        video_id: Video ID in TwelveLabs
-        video_name: Name of the video
-
-    Returns:
-        Analysis results as dictionary
-
-    Raises:
-        Exception: If analysis fails
-    """
-    url = "https://api.twelvelabs.io/v1.3/analyze"
-    headers = {"x-api-key": TWELVELABS_API_KEY, "Content-Type": "application/json"}
-
-    payload = {
-        "video_id": video_id,
-        "prompt": """Analyze this advertisement video and provide comprehensive insights:
-1. A descriptive title for the ad
-2. A detailed summary covering:
-   - Main message and value proposition
-   - Target audience appeal
-   - Key visual and audio elements
-   - Emotional tone and mood
-   - Brand presence and messaging
-   - Call-to-action effectiveness
-3. Keywords for categorization (themes, emotions, techniques, etc.)
-4. Creative strengths and potential areas for improvement""",
-        "temperature": 0.2,
-        "stream": False,
-        "response_format": {
-            "type": "json_schema",
-            "json_schema": {
-                "type": "object",
-                "properties": {
-                    "title": {"type": "string"},
-                    "summary": {"type": "string"},
-                    "keywords": {"type": "array", "items": {"type": "string"}},
-                    "creative_elements": {
-                        "type": "object",
-                        "properties": {
-                            "visual_style": {"type": "string"},
-                            "audio_elements": {"type": "string"},
-                            "emotional_tone": {"type": "string"},
-                            "brand_presence": {"type": "string"},
-                            "call_to_action": {"type": "string"},
-                        },
-                    },
-                    "strengths": {"type": "array", "items": {"type": "string"}},
-                    "improvement_areas": {"type": "array", "items": {"type": "string"}},
-                },
-                "required": ["title", "summary", "keywords"],
-            },
-        },
-        "max_tokens": 2000,
-    }

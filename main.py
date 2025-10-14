@@ -17,7 +17,6 @@ from dotenv import load_dotenv
 from fastapi.middleware.cors import CORSMiddleware
 import tempfile
 
-from routers.vapi_router import router as vapi_router
 from routers.twelvelabs_router import router as twelvelabs_router
 from src.db.models import SearchRequest, SearchResponse
 
@@ -35,7 +34,6 @@ app.add_middleware(
 )
 
 # Include routers
-app.include_router(vapi_router)
 app.include_router(twelvelabs_router)
 
 # Initialize Supabase client
