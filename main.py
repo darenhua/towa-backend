@@ -51,9 +51,6 @@ anthropic_client = (
     AsyncAnthropic(api_key=ANTHROPIC_API_KEY) if ANTHROPIC_API_KEY else None
 )
 
-# Initialize TwelveLabs
-TWELVELABS_API_KEY = os.getenv("TWELVELABS_API_KEY", "")
-
 
 def save_persona_to_supabase(
     job_id: str, items: List[Dict[str, Any]], prompt: str
