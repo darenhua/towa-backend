@@ -1,4 +1,4 @@
-from fastapi import FastAPI, HTTPException, status
+from fastapi import FastAPI, BackgroundTasks, HTTPException, status
 import uvicorn
 import os
 import requests
@@ -16,6 +16,7 @@ from twelvelabs import TwelveLabs
 from dotenv import load_dotenv
 from fastapi.middleware.cors import CORSMiddleware
 import tempfile
+import datetime
 
 from routers.twelvelabs_router import router as twelvelabs_router
 from src.db.models import SearchRequest, SearchResponse
@@ -76,8 +77,26 @@ def save_persona_to_supabase(
                 "prompt": prompt,
             }
 
-            # Insert into Supabase
-            result = supabase.table("persona").insert(persona_record).execute()
+            # Check if persona already exists for this job_id and linkedin_url
+            existing = (
+                supabase.table("persona")
+                .select("id")
+                .eq("job_id", job_id)
+                .eq("linkedin_url", persona_record["linkedin_url"])
+                .execute()
+            )
+
+            if existing.data:
+                # Update existing record
+                result = (
+                    supabase.table("persona")
+                    .update(persona_record)
+                    .eq("id", existing.data[0]["id"])
+                    .execute()
+                )
+            else:
+                # Insert new record
+                result = supabase.table("persona").insert(persona_record).execute()
 
             if result.data:
                 saved_personas.append(result.data[0])
@@ -126,17 +145,42 @@ def get_webset_status(api_key: str, webset_id: str) -> Dict[str, Any]:
 
 
 def wait_for_webset_completion(
-    api_key: str, webset_id: str, max_wait_time: int = 300, poll_interval: int = 5
+    api_key: str,
+    webset_id: str,
+    job_id: str,
+    prompt: str,
+    max_wait_time: int = 300,
+    poll_interval: int = 0.5,
 ) -> Dict[str, Any]:
-    """Wait for webset to complete processing"""
+    """Wait for webset to complete processing and upsert personas during polling"""
     start_time = time.time()
+    latest_items = []
 
     while time.time() - start_time < max_wait_time:
         try:
             webset_data = get_webset_status(api_key, webset_id)
             status = webset_data.get("status")
+            print("Polling", status)
+
+            # Get items and upsert personas on each poll
+            try:
+                items = get_webset_items(api_key, webset_id)
+                if items:
+                    latest_items = items
+                    save_persona_to_supabase(job_id, items, prompt)
+            except Exception as e:
+                print(f"Warning: Could not fetch items during polling: {e}")
 
             if status in ["paused", "idle", "completed"]:
+                # Final fetch of items before returning
+                try:
+                    final_items = get_webset_items(api_key, webset_id)
+                    if final_items:
+                        latest_items = final_items
+                        save_persona_to_supabase(job_id, final_items, prompt)
+                except Exception as e:
+                    print(f"Warning: Could not fetch final items: {e}")
+
                 return webset_data
 
             time.sleep(poll_interval)
@@ -173,12 +217,7 @@ def health_check():
     return {"status": "healthy"}
 
 
-@app.post("/{job_id}/search", response_model=SearchResponse)
-def search(job_id: str, request: SearchRequest):
-    """
-    Take a normal sentence and use it to search with Exa websets
-    """
-    print("TEST")
+def do_search(job_id: str, request: SearchRequest):
     try:
         # Check if API key is available
         api_key = os.getenv("EXA_API_KEY")
@@ -197,24 +236,43 @@ def search(job_id: str, request: SearchRequest):
         if not webset_id:
             raise Exception("No webset ID returned from Exa API")
 
-        # Wait for webset to complete processing
-        completed_webset = wait_for_webset_completion(api_key, webset_id)
+        # Wait for webset to complete processing (personas are saved during polling)
+        completed_webset = wait_for_webset_completion(
+            api_key, webset_id, job_id, request.sentence
+        )
 
-        # Get items from completed webset
+        # Get final items from completed webset
         items = get_webset_items(api_key, webset_id)
 
-        # Save persona data to Supabase
-        saved_personas = save_persona_to_supabase(job_id, items, request.sentence)
+        result = (
+            supabase.table("jobs")
+            .update({"personas_synced_at": datetime.datetime.now().isoformat()})
+            .eq("id", job_id)
+            .execute()
+        )
 
         return SearchResponse(
             success=True,
             webset_id=webset_id,
             items=items,
-            saved_personas_count=len(saved_personas),
+            saved_personas_count=len(
+                items
+            ),  # Items count as saved personas are handled during polling
         )
 
     except Exception as e:
         return SearchResponse(success=False, error=str(e))
+
+
+@app.post("/{job_id}/search", response_model=SearchResponse)
+def search(job_id: str, request: SearchRequest, background_tasks: BackgroundTasks):
+    """
+    Take a normal sentence and use it to search with Exa websets
+    """
+    background_tasks.add_task(do_search, job_id, request)
+    return SearchResponse(
+        success=True, webset_id=None, items=None, saved_personas_count=0
+    )
 
 
 def get_job_by_id(supabase_client: Client, job_id: str) -> Dict[str, Any]:

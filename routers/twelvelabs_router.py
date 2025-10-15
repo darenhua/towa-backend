@@ -1,7 +1,7 @@
 # Create router
 from pathlib import Path
 from typing import Optional, Dict, Any, List
-from fastapi import APIRouter, HTTPException, status
+from fastapi import APIRouter, HTTPException, status, BackgroundTasks
 from src.db.models import VideoAnalysisRequest, VideoAnalysisResponse
 from anthropic import AsyncAnthropic
 from supabase import create_client, Client
@@ -56,8 +56,8 @@ MAX_DURATION = 7200  # seconds (2 hours)
 MAX_FILE_SIZE = 2 * 1024 * 1024 * 1024  # 2GB in bytes
 
 
-@router.post("/{job_id}/initialize")
-async def initialize(job_id: str):
+def do_initialize(job_id: str):
+    print(f"Initializing video for job {job_id}")
     towa_index_id = get_or_create_index()
 
     job_result = supabase.table("jobs").select("ads_id").eq("id", job_id).execute()
@@ -82,7 +82,7 @@ async def initialize(job_id: str):
 
     print(f"✓ Video saved to temporary file: {temp_file_path}")
 
-    new_path = await process_and_validate_video(Path(temp_file_path))
+    new_path = process_and_validate_video(Path(temp_file_path))
     # Upload video using SDK
     with open(new_path, "rb") as video_file:
         task = twelvelabs_client.tasks.create(
@@ -135,6 +135,12 @@ async def initialize(job_id: str):
         "video_id": video_id,
         "description": description_result,
     }
+
+
+@router.post("/{job_id}/initialize")
+async def initialize(job_id: str, background_tasks: BackgroundTasks):
+    background_tasks.add_task(do_initialize, job_id)
+    return {"success": True}
 
 
 def get_or_create_index() -> str:
@@ -563,7 +569,7 @@ def find_closest_aspect_ratio(width: int, height: int) -> tuple[str, tuple[int, 
     return ratio_str, (target_width, target_height)
 
 
-async def process_and_validate_video(input_path: Path) -> Path:
+def process_and_validate_video(input_path: Path) -> Path:
     try:
         # Step 2: Extract metadata
         print("\nStep 2: Extracting video metadata...")
